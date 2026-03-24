@@ -7737,6 +7737,7 @@ class CacheMetricsSchema(BaseModel):
     keyspace_hits: int = Field(0, description="Successful key lookups")
     keyspace_misses: int = Field(0, description="Failed key lookups")
 
+
 class HealthStatusItem(BaseModel):
     """Individual health status item for a service component."""
 
@@ -7750,6 +7751,7 @@ class HealthCheckResponse(BaseModel):
 
     status: str = Field(..., description="Overall health status: 'healthy' if all components are healthy, 'unhealthy' otherwise")
     statusItems: List[HealthStatusItem] = Field(..., description="List of component health statuses")
+    mcp_runtime: Dict[str, Any] = Field(default_factory=dict, description="MCP runtime diagnostics and configuration")
 
 
 class GunicornMetricsSchema(BaseModel):
