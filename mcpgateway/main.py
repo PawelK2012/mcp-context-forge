@@ -1954,7 +1954,7 @@ def validate_security_configuration():
     # Critical security checks (fail startup only if REQUIRE_STRONG_SECRETS=true)
     critical_issues = []
 
-    if settings.jwt_secret_key == "my-test-key" and not settings.dev_mode:  # nosec B105 - checking for default value
+    if settings.jwt_secret_key in ("my-test-key", "my-test-key-but-now-longer-than-32-bytes") and not settings.dev_mode:  # nosec B105 - checking for default values
         critical_issues.append("Using default JWT secret in non-dev mode. Set JWT_SECRET_KEY environment variable!")
 
     if settings.basic_auth_password.get_secret_value() == "changeme" and settings.mcpgateway_ui_enabled:  # nosec B105 - checking for default value
@@ -2039,7 +2039,7 @@ def log_security_recommendations(security_status: settings.SecurityStatus):
         logger.info("📋 SECURITY RECOMMENDATIONS:")
         logger.info("=" * 60)
 
-        if settings.jwt_secret_key == "my-test-key":  # nosec B105 - checking for default value
+        if settings.jwt_secret_key in ("my-test-key", "my-test-key-but-now-longer-than-32-bytes"):  # nosec B105 - checking for default value
             logger.info("  • Generate a strong JWT secret:")
             logger.info("    python3 -c 'import secrets; print(secrets.token_urlsafe(32))'")
 
@@ -2678,7 +2678,7 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
                             pass  # keep raw value for non-UUID token_teams
                     # Only trust team_id if it is in the user's DB-resolved teams
                     validated_team_id = request_team_id if (token_teams and request_team_id and request_team_id in token_teams) else None
-                    has_admin_access = await permission_service.has_admin_permission(username, team_id=validated_team_id)
+                    has_admin_access = await permission_service.has_admin_permission(username, team_id=validated_team_id, token_teams=token_teams)
                     if not has_admin_access:
                         logger.warning(f"Admin access denied for user without admin permissions: {SecurityValidator.sanitize_log_message(str(username))}")
                         return self._error_response(request, root_path, 403, "Admin privileges required", "admin_required")
@@ -2830,6 +2830,24 @@ class MCPPathRewriteMiddleware:
         # These paths may end with /mcp but should not be rewritten to the MCP transport
         if not original_path.startswith("/.well-known/"):
             if (original_path.endswith("/mcp") and original_path != "/mcp") or (original_path.endswith("/mcp/") and original_path != "/mcp/"):
+                # SECURITY: Only rewrite recognised MCP paths — /servers/{id}/mcp.
+                # Arbitrary prefixes (e.g. /foo/mcp) must NOT be rewritten to
+                # /mcp/ as that would expose the global MCP transport under
+                # undocumented aliases, broadening the externally reachable
+                # route surface.
+                if original_path.startswith("/servers/"):
+                    # Validate that a non-empty server_id segment is present.
+                    # Without this check, paths like /servers//mcp (empty ID)
+                    # would be rewritten and silently fall through (#3891).
+                    _srv_match = re.match(r"/servers/([^/]+)/mcp", original_path)
+                    if not _srv_match:
+                        response = ORJSONResponse({"detail": "Invalid server identifier"}, status_code=404)
+                        await response(scope, receive, send)
+                        return
+                else:
+                    # Not a /servers/ path — do not rewrite, pass through
+                    await self.application(scope, receive, send)
+                    return
                 # Rewrite to /mcp/ and continue through middleware (lets CORSMiddleware handle preflight)
                 scope["path"] = "/mcp/"
                 await self.application(scope, receive, send)
@@ -3094,8 +3112,17 @@ def get_db(request: Request = None):
 
     When observability is enabled, this reuses the session created by
     ObservabilityMiddleware (stored in request.state.db) to avoid duplicate
-    session creation. When observability is disabled or the
-    middleware hasn't created a session, this creates its own session.
+    session creation. When observability is disabled or the middleware hasn't
+    created a session, this creates its own session.
+
+    **Transaction Control**: This function ALWAYS controls transaction boundaries
+    (commit/rollback) regardless of whether it creates the session or reuses one
+    from middleware. This ensures predictable transaction semantics for route
+    handlers and maintains data integrity.
+
+    **Session Lifecycle**: Middleware manages session lifecycle (create/close)
+    while this function manages transactions (commit/rollback). This separation
+    of concerns prevents the transaction management violation described in #3731.
 
     Commits the transaction on successful completion to avoid implicit rollbacks
     for read-only operations. Rolls back explicitly on exception.
@@ -3116,7 +3143,10 @@ def get_db(request: Request = None):
         Exception: Re-raises any exception after rolling back the transaction.
 
     Ensures:
-        The database session is closed after the request completes, even in the case of an exception.
+        - Transaction is committed on success (for both owned and reused sessions)
+        - Transaction is rolled back on error (for both owned and reused sessions)
+        - Session is closed only if created by this function (not if reused from middleware)
+        - Broken connections are invalidated to prevent pool corruption
 
     Examples:
         >>> # Test that get_db returns a generator
@@ -3140,9 +3170,32 @@ def get_db(request: Request = None):
         db = request.state.db
         if db is not None:
             logger.debug(f"[GET_DB] Reusing session from middleware: {id(db)}")
-            # Yield the middleware's session without closing it
-            # The middleware will handle commit/rollback/close
-            yield db
+            # Yield the middleware's session. We control transactions, middleware controls lifecycle.
+            try:
+                yield db
+                # Commit on successful completion (only if transaction still active)
+                # The transaction can become inactive if an exception occurred during
+                # async context manager cleanup (e.g., CancelledError during MCP session teardown).
+                if db.is_active:
+                    db.commit()
+            except Exception:
+                try:
+                    # Always call rollback() in exception handler.
+                    # rollback() is safe to call even when is_active=False - it succeeds and
+                    # restores the session to a usable state. When is_active=False (e.g., after
+                    # IntegrityError), rollback() is actually REQUIRED to clear the failed state.
+                    # Skipping rollback when is_active=False would leave the session unusable.
+                    db.rollback()
+                except Exception:
+                    # Connection is broken - invalidate to remove from pool
+                    # This handles cases like PgBouncer query_wait_timeout where
+                    # the connection is dead and rollback itself fails
+                    try:
+                        db.invalidate()
+                    except Exception:
+                        pass  # nosec B110 - Best effort cleanup on connection failure
+                raise
+            # Don't close - middleware owns the session lifecycle
             return
 
     # Fallback: Create our own session (observability disabled or middleware didn't create one)
@@ -3177,6 +3230,32 @@ def get_db(request: Request = None):
             db.close()
         except Exception:
             pass  # nosec B110 - Best effort cleanup on already-failed prompt bridge sessions
+
+
+async def require_valid_server(server_id: str, db: Session = Depends(get_db)) -> str:
+    """FastAPI dependency that validates a server_id exists in the database.
+
+    Provides a reusable, fail-closed guard for any server-scoped endpoint.
+    Uses the lightweight ``entity_exists()`` check — no eager loading.
+
+    Args:
+        server_id: Path parameter extracted by FastAPI.
+        db: Database session from the ``get_db`` dependency.
+
+    Returns:
+        The validated server_id string.
+
+    Raises:
+        HTTPException: 404 if the server does not exist, 503 on database errors.
+    """
+    try:
+        if not await server_service.entity_exists(db, server_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server not found")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable — unable to verify server")
+    return server_id
 
 
 async def _read_request_json(request: Request) -> Any:
@@ -4044,7 +4123,7 @@ async def sse_endpoint(request: Request, server_id: str, db: Session = Depends(g
 
 @server_router.post("/{server_id}/message")
 @require_permission("servers.use")
-async def message_endpoint(request: Request, server_id: str, user=Depends(get_current_user_with_permissions)):
+async def message_endpoint(request: Request, server_id: str = Depends(require_valid_server), user=Depends(get_current_user_with_permissions)):
     """
     Handles incoming messages for a specific server.
 
@@ -5286,6 +5365,7 @@ async def list_resources(
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
@@ -5301,6 +5381,7 @@ async def list_resources(
         tags (Optional[str]): Comma-separated list of tags to filter by.
         team_id (Optional[str]): Filter by specific team ID.
         visibility (Optional[str]): Filter by visibility (private, team, public).
+        gateway_id (Optional[str]): Filter by gateway ID. Use 'null' for resources without a gateway.
         db (Session): Database session.
         user (str): Authenticated user.
 
@@ -5339,7 +5420,7 @@ async def list_resources(
     # Use unified list_resources() with token-based team filtering
     # Always apply visibility filtering based on token scope
     logger.debug(
-        f"User {SecurityValidator.sanitize_log_message(user_email)} requested resource list with cursor {cursor}, include_inactive={include_inactive}, tags={tags_list}, team_id={team_id}, visibility={visibility}"
+        f"User {SecurityValidator.sanitize_log_message(user_email)} requested resource list with cursor {cursor}, include_inactive={include_inactive}, tags={tags_list}, team_id={team_id}, visibility={visibility}, gateway_id={gateway_id}"
     )
     data, next_cursor = await resource_service.list_resources(
         db=db,
@@ -5347,6 +5428,7 @@ async def list_resources(
         limit=limit,
         include_inactive=include_inactive,
         tags=tags_list,
+        gateway_id=gateway_id,
         user_email=user_email,
         team_id=team_id,
         visibility=visibility,
@@ -5790,6 +5872,7 @@ async def list_prompts(
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
@@ -5805,6 +5888,7 @@ async def list_prompts(
         tags: Comma-separated list of tags to filter by.
         team_id: Filter by specific team ID.
         visibility: Filter by visibility (private, team, public).
+        gateway_id: Filter by gateway ID. Use 'null' for prompts without a gateway.
         db: Database session.
         user: Authenticated user.
 
@@ -5843,7 +5927,7 @@ async def list_prompts(
     # Use consolidated prompt listing with token-based team filtering
     # Always apply visibility filtering based on token scope
     logger.debug(
-        f"User: {SecurityValidator.sanitize_log_message(user_email)} requested prompt list with include_inactive={include_inactive}, cursor={cursor}, tags={tags_list}, team_id={team_id}, visibility={visibility}"
+        f"User: {SecurityValidator.sanitize_log_message(user_email)} requested prompt list with include_inactive={include_inactive}, cursor={cursor}, tags={tags_list}, team_id={team_id}, visibility={visibility}, gateway_id={gateway_id}"
     )
     data, next_cursor = await prompt_service.list_prompts(
         db=db,
@@ -5851,6 +5935,7 @@ async def list_prompts(
         limit=limit,
         include_inactive=include_inactive,
         tags=tags_list,
+        gateway_id=gateway_id,
         user_email=user_email,
         team_id=team_id,
         visibility=visibility,
