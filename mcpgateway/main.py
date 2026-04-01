@@ -10310,7 +10310,7 @@ async def readiness_check(response: Response):
 
     # Database health check (run in thread to avoid blocking event loop)
     db_success, db_error = await asyncio.to_thread(_check_db_ready)
-    
+
     if db_success:
         status_items.append(HealthStatusItem(name="Database", status_code=status.HTTP_200_OK, message="Database Connection Successful"))
     else:
